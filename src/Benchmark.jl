@@ -1,101 +1,66 @@
-# src/Benchmark.jl
-
-function benchmark()
+export benchmark_davidson
+export benchmark_diis
+export benchmark_optimization
+export run_all_benchmarks
+function benchmark_davidson()
 	Random.seed!(1234)
 	n_roots = 4
-
-	function measure(f)
-		try
-			return (@belapsed $f() samples=100) * 1000
-		catch
-			return NaN
-		end
+	function measure_time(f)
+		return (@belapsed $f() samples=20) * 1000
 	end
-
 	println("\n" * "="^90)
-	@printf("%-10s | %-6s | %-10s | %-10s | %-10s | %-10s | %s\n",
-		"Type", "N", "ChemAlg", "Arpack", "Krylov", "LOBPCG", "Speedup/Winner")
+	println("BENCHMARK: Davidson (Eigenvalue Solver)")
+	println("="^90)
+	@printf("%-12s | %-6s | %-10s | %-10s | %-8s | %s\n",
+		"Matrix", "N", "ChemAlg", "Arpack", "Speedup", "Status")
 	println("-"^90)
-
 	scenarios = [
-		("Near-Diag", [1000, 5000, 10000, 20000], N -> begin
-			D = spdiagm(0 => sort(rand(N)) .* 50.0)
-			R = sprand(N, N, max(0.001, 10.0/N))
-			D + 0.01 * (R + R')
-		end),
-		("Random", [500, 1000, 2000], N -> begin
-			A = randn(N, N)
-			(A + A') / 2
-		end),
+		("Near-Diag", [1000, 5000], N -> begin
+		D = spdiagm(0 => sort(rand(N)) .* 50.0)
+		R = sprand(N, N, max(0.001, 10.0/N))
+		D + 0.01 * (R + R')
+	end)
 	]
-
 	for (label, dims, mat_gen) in scenarios
 		for N in dims
 			H = mat_gen(N)
-
-			X0 = zeros(N, n_roots)
-			for i in 1:n_roots
-				X0[i, i] = 1.0
-			end
-			x0 = X0[:, 1]
-			P  = issparse(H) ? Diagonal(1.0 ./ diag(H)) : I
-
-			if N == dims[1]
-				# 预热不使用分号，展开写
-				try
-					Davidson(H, n_roots, max_iter = 2)
-				catch
-				end
-			end
-
-			t_my = measure(() -> Davidson(H, n_roots, tol = 1e-6))
-
-			t_ar = measure(() -> eigs(H, nev = n_roots, which = :SR, v0 = x0, tol = 1e-6))
-
-			t_kr = measure(() -> KrylovKit.eigsolve(H, x0, n_roots, :SR, tol = 1e-6))
-
-			t_lo = measure(() -> IterativeSolvers.lobpcg(H, false, X0, P = P, tol = 1e-6))
-
-			times = [t_my, t_ar, t_kr, t_lo]
-			best = minimum(filter(!isnan, times))
-
-			win_mark = ""
-			if best == t_my
-				win_mark = "ChemAlg 🚀"
-			elseif best == t_lo
-				win_mark = "LOBPCG"
-			else
-				win_mark = "Other"
-			end
-
-			fmt(t) = isnan(t) ? "FAIL" : @sprintf("%.2f", t)
-
-			@printf("%-10s | %-6d | %10s | %10s | %10s | %10s | %s\n",
-				label, N, fmt(t_my), fmt(t_ar), fmt(t_kr), fmt(t_lo), win_mark)
+			evals_ref, _ = eigs(H, nev = n_roots, which = :SR, tol = 1e-8)
+			sort!(evals_ref)
+			evals_my, _ = Davidson(H, n_roots, tol = 1e-8)
+			sort!(evals_my)
+			diff = norm(evals_my - evals_ref)
+			status = diff < 1e-6 ? "PASS" : "FAIL"
+			x0 = zeros(N)
+			x0[1] = 1.0
+			t_my = measure_time(() -> Davidson(H, n_roots, tol = 1e-6))
+			t_ar = measure_time(() -> eigs(H, nev = n_roots, which = :SR, v0 = x0, tol = 1e-6))
+			speedup = t_ar / t_my
+			@printf("%-12s | %-6d | %10.2f | %10.2f | %7.1fx | %s (Err=%.1e)\n",
+				label, N, t_my, t_ar, speedup, status, diff)
 		end
-		println("-"^90)
 	end
+	println("-"^90)
 end
-
 function benchmark_diis()
 	Random.seed!(1234)
-	dims = [100, 300, 500]
-	hist = 8
-
+	dims = [500, 1000]
+	hist = 10
 	scf_step(F) = 0.95 .* F .+ 0.05 .* sin.(F)
 	nlsolve_f!(s, x) = (s .= x .- scf_step(x))
-
-	println("\n" * "="^60)
-	@printf("%-6s | %-10s | %-10s | %s\n", "N", "ChemAlg", "NLsolve", "Speedup")
-	println("-"^60)
-
+	function measure_time(f)
+		return (@belapsed $f() samples=20) * 1000
+	end
+	println("\n" * "="^90)
+	println("BENCHMARK: DIIS (Acceleration)")
+	println("="^90)
+	@printf("%-6s | %-10s | %-10s | %-8s\n", "N", "ChemAlg", "NLsolve", "Speedup")
+	println("-"^90)
 	for N in dims
 		F0 = rand(N, N)
-
 		function run_chem(F_in)
 			mgr = DIISManager{Matrix{Float64}}(hist)
 			F = copy(F_in)
-			for _ in 1:100
+			for _ in 1:200
 				err = scf_step(F) - F
 				if norm(err) < 1e-6
 					break
@@ -104,13 +69,52 @@ function benchmark_diis()
 			end
 			F
 		end
-
-		t_chem = (@belapsed $run_chem($F0) samples=100) * 1000
-
-		t_nl = (@belapsed nlsolve($nlsolve_f!, $F0, method = :anderson, m = $hist, ftol = 1e-6) samples=100) * 1000
-
-		@printf("%-6d | %10.2f | %10.2f | x%.1f 🚀\n",
-			N, t_chem, t_nl, t_nl / t_chem)
+		t_my = measure_time(() -> run_chem(F0))
+		t_nl = measure_time(() -> nlsolve(nlsolve_f!, F0, method = :anderson, m = hist, ftol = 1e-6))
+		@printf("%-6d | %10.2f | %10.2f | %7.1fx\n", N, t_my, t_nl, t_nl / t_my)
 	end
-	println("="^60)
+	println("-"^90)
+end
+function rosen_fg_2d!(G, x)
+	val = (1.0 - x[1])^2 + 100.0 * (x[2] - x[1]^2)^2
+	if G !== nothing
+		G[1] = -2.0 * (1.0 - x[1]) - 400.0 * x[1] * (x[2] - x[1]^2)
+		G[2] = 200.0 * (x[2] - x[1]^2)
+	end
+	return val
+end
+function rosen_f_optim(x)
+	rosen_fg_2d!(nothing, x)
+end
+function rosen_g_optim!(G, x)
+	rosen_fg_2d!(G, x)
+	return nothing
+end
+function benchmark_optimization()
+	Random.seed!(1234)
+	function measure_time(f)
+		return (@belapsed $f() samples=100) * 1000
+	end
+	println("\n" * "="^90)
+	println("BENCHMARK: BFGS (Geometry Optimization)")
+	println("="^90)
+	@printf("%-18s | %-10s | %-10s | %-8s | %s\n",
+		"Case", "ChemAlg", "Optim.jl", "Speedup", "Status")
+	println("-"^90)
+	x0 = [-1.2, 1.0]
+	_, E_my, _ = bfgs_optimize(rosen_fg_2d!, copy(x0), tol = 1e-8)
+	res_opt = Optim.optimize(rosen_f_optim, rosen_g_optim!, copy(x0), Optim.BFGS(), Optim.Options(g_tol = 1e-8))
+	E_ref = Optim.minimum(res_opt)
+	diff = abs(E_my - E_ref)
+	status = (diff < 1e-6 && E_my < 1e-6) ? "PASS" : "FAIL"
+	t_my = measure_time(() -> bfgs_optimize(rosen_fg_2d!, copy(x0), tol = 1e-8))
+	t_opt = measure_time(() -> Optim.optimize(rosen_f_optim, rosen_g_optim!, copy(x0), Optim.BFGS(), Optim.Options(g_tol = 1e-8)))
+	@printf("%-18s | %10.4f | %10.4f | %7.1fx | %s (E=%.1e)\n",
+		"Rosenbrock(2D)", t_my, t_opt, t_opt/t_my, status, E_my)
+	println("-"^90)
+end
+function run_all_benchmarks()
+	benchmark_davidson()
+	benchmark_diis()
+	benchmark_optimization()
 end
